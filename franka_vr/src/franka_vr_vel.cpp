@@ -23,25 +23,15 @@ constexpr auto K_BASE_FRAME = "fr3_link0";
 constexpr auto K_TIP_FRAME = "fr3_hand";
 constexpr double POSITION_TOLERANCE = 0.002;     // 位置容差（米）
 constexpr double ORIENTATION_TOLERANCE = 0.05;  // 角度容差（弧度）
-constexpr double LINEAR_VEL_HARD_LIMIT = 0.28;   // m/s
-constexpr double ANGULAR_VEL_HARD_LIMIT = 0.75;  // rad/s
+constexpr double LINEAR_VEL_HARD_LIMIT = 0.35;   // m/s
+constexpr double ANGULAR_VEL_HARD_LIMIT = 0.95;  // rad/s
 constexpr double TARGET_STALE_TIMEOUT_S = 0.20;  // 超时后清零，防止陈旧目标持续积分
-constexpr double MIN_TARGET_DT_S = 0.010;        // 避免服务/回调抖动导致的极小dt
-constexpr double MAX_TARGET_DELTA_POSITION_M = 0.012;  // 单帧最大平移增量
-constexpr double MAX_TARGET_DELTA_ROTATION_RAD = 0.12; // 单帧最大旋转增量
-constexpr double MAX_TARGET_JUMP_POSITION_M = 0.08;    // 目标跳变阈值（欧式距离）
-constexpr double MAX_TARGET_JUMP_Z_M = 0.05;           // 目标跳变阈值（Z轴）
-constexpr double MAX_TARGET_JUMP_ROTATION_RAD = 0.80;  // 目标跳变阈值（姿态）
-constexpr double LINEAR_ACCEL_LIMIT = 0.7;             // m/s^2
-constexpr double ANGULAR_ACCEL_LIMIT = 2.0;            // rad/s^2
-constexpr double ZERO_TWIST_EPS = 1e-4;
-constexpr double DIAGNOSTIC_LOG_PERIOD_S = 1.0;
 }  // namespace
 
-static Eigen::Vector3d linear_step_size{ 0.20, 0.20, 0.20 };
-static Eigen::AngleAxisd x_step_size(0.60, Eigen::Vector3d::UnitX());
-static Eigen::AngleAxisd y_step_size(0.60, Eigen::Vector3d::UnitY());
-static Eigen::AngleAxisd z_step_size(0.60, Eigen::Vector3d::UnitZ());
+static Eigen::Vector3d linear_step_size{ 0.26, 0.26, 0.26 };
+static Eigen::AngleAxisd x_step_size(0.75, Eigen::Vector3d::UnitX());
+static Eigen::AngleAxisd y_step_size(0.75, Eigen::Vector3d::UnitY());
+static Eigen::AngleAxisd z_step_size(0.75, Eigen::Vector3d::UnitZ());
 static geometry_msgs::msg::Pose target_pose;
 static bool target_set = false;
 static uint64_t target_sequence = 0;
@@ -74,24 +64,20 @@ double compute_shortest_orientation_error(const geometry_msgs::msg::Pose& previo
   return q_prev.angleShortestPath(q_curr);
 }
 
-Eigen::Vector3d apply_acceleration_limit(const Eigen::Vector3d& current,
-                                         const Eigen::Vector3d& target,
-                                         double accel_limit,
-                                         double dt_s)
+Eigen::Vector3d clamp_vector_norm(const Eigen::Vector3d& vector, double max_norm)
 {
-  if (dt_s <= 0.0 || accel_limit <= 0.0)
+  if (max_norm <= 0.0)
   {
-    return target;
+    return Eigen::Vector3d::Zero();
   }
 
-  const double max_delta = accel_limit * dt_s;
-  Eigen::Vector3d next = current;
-  for (int i = 0; i < 3; ++i)
+  const double norm = vector.norm();
+  if (norm <= max_norm || norm < 1e-9)
   {
-    const double delta = std::clamp(target[i] - current[i], -max_delta, max_delta);
-    next[i] += delta;
+    return vector;
   }
-  return next;
+
+  return vector * (max_norm / norm);
 }
 
 Eigen::Isometry3d pose_msg_to_eigen(const geometry_msgs::msg::Pose& pose_msg)
@@ -112,6 +98,47 @@ Eigen::Isometry3d pose_msg_to_eigen(const geometry_msgs::msg::Pose& pose_msg)
   }
   pose.linear() = quat.toRotationMatrix();
   return pose;
+}
+
+Eigen::Vector3d compute_orientation_error_vector(const geometry_msgs::msg::Pose& current,
+                                                 const geometry_msgs::msg::Pose& target)
+{
+  Eigen::Quaterniond q_current(current.orientation.w, current.orientation.x, current.orientation.y,
+                               current.orientation.z);
+  Eigen::Quaterniond q_target(target.orientation.w, target.orientation.x, target.orientation.y,
+                              target.orientation.z);
+
+  if (q_current.norm() < 1e-8)
+  {
+    q_current = Eigen::Quaterniond::Identity();
+  }
+  else
+  {
+    q_current.normalize();
+  }
+
+  if (q_target.norm() < 1e-8)
+  {
+    q_target = Eigen::Quaterniond::Identity();
+  }
+  else
+  {
+    q_target.normalize();
+  }
+
+  if (q_current.dot(q_target) < 0.0)
+  {
+    q_target.coeffs() *= -1.0;
+  }
+
+  const Eigen::Quaterniond q_error = q_target * q_current.inverse();
+  Eigen::AngleAxisd angle_axis(q_error);
+  if (std::abs(angle_axis.angle()) < 1e-9 || !std::isfinite(angle_axis.angle()))
+  {
+    return Eigen::Vector3d::Zero();
+  }
+
+  return angle_axis.axis() * angle_axis.angle();
 }
 
 void set_step_size_callback(const rclcpp::Node::SharedPtr& node,
@@ -272,7 +299,7 @@ int main(int argc, char* argv[])
   const moveit::core::JointModelGroup* joint_model_group =
       robot_state->getJointModelGroup(servo_params.move_group_name);
 
-  servo.setCommandType(CommandType::POSE);
+  servo.setCommandType(CommandType::TWIST);
 
   std::deque<KinematicState> joint_cmd_rolling_window;
   KinematicState current_state = servo.getCurrentRobotState(true);
@@ -344,11 +371,43 @@ int main(int argc, char* argv[])
         continue;
       }
 
-      PoseCommand target_pose_command;
-      target_pose_command.frame_id = K_BASE_FRAME;
-      target_pose_command.pose = pose_msg_to_eigen(local_target_pose);
+      auto actual_robot_state = planning_scene_monitor->getStateMonitor()->getCurrentState();
+      if (!actual_robot_state)
+      {
+        tracking_rate.sleep();
+        continue;
+      }
 
-      joint_state = servo.getNextJointState(robot_state, target_pose_command);
+      const geometry_msgs::msg::Pose current_pose =
+          tf2::toMsg(actual_robot_state->getGlobalLinkTransform(K_TIP_FRAME));
+      const Eigen::Vector3d position_error = compute_position_error(current_pose, local_target_pose);
+      const Eigen::Vector3d orientation_error = compute_orientation_error_vector(current_pose, local_target_pose);
+      const double position_error_norm = position_error.norm();
+      const double orientation_error_norm = orientation_error.norm();
+
+      const Eigen::Vector3d linear_gain = linear_step_size.cwiseAbs();
+      const Eigen::Vector3d angular_gain(std::abs(x_step_size.angle()), std::abs(y_step_size.angle()),
+                                         std::abs(z_step_size.angle()));
+
+      Eigen::Vector3d linear_vel =
+          clamp_vector_norm(linear_gain.cwiseProduct(position_error), LINEAR_VEL_HARD_LIMIT);
+      Eigen::Vector3d angular_vel =
+          clamp_vector_norm(angular_gain.cwiseProduct(orientation_error), ANGULAR_VEL_HARD_LIMIT);
+
+      if (position_error_norm < POSITION_TOLERANCE)
+      {
+        linear_vel.setZero();
+      }
+      if (orientation_error_norm < ORIENTATION_TOLERANCE)
+      {
+        angular_vel.setZero();
+      }
+
+      TwistCommand target_twist{ K_BASE_FRAME,
+                                 { linear_vel.x(), linear_vel.y(), linear_vel.z(), angular_vel.x(), angular_vel.y(),
+                                   angular_vel.z() } };
+
+      joint_state = servo.getNextJointState(robot_state, target_twist);
       StatusCode status = servo.getStatus();
 
       if (status != StatusCode::INVALID)
@@ -370,33 +429,21 @@ int main(int argc, char* argv[])
                                static_cast<unsigned long long>(trajectory_publish_count), msg->points.size(),
                                local_target_pose.position.x, local_target_pose.position.y, local_target_pose.position.z);
 
-          auto actual_robot_state = planning_scene_monitor->getStateMonitor()->getCurrentState();
-          if (actual_robot_state)
+          moveit_msgs::msg::ServoStatus local_servo_status;
+          bool local_servo_status_received = false;
           {
-            const Eigen::Isometry3d actual_tip_pose = actual_robot_state->getGlobalLinkTransform(K_TIP_FRAME);
-            const Eigen::Isometry3d target_pose_eigen = pose_msg_to_eigen(local_target_pose);
-            const double pos_error_norm =
-                (target_pose_eigen.translation() - actual_tip_pose.translation()).norm();
-            const Eigen::Quaterniond q_target(target_pose_eigen.linear());
-            const Eigen::Quaterniond q_actual(actual_tip_pose.linear());
-            const double rot_error = q_actual.angularDistance(q_target);
-
-            moveit_msgs::msg::ServoStatus local_servo_status;
-            bool local_servo_status_received = false;
-            {
-              std::lock_guard<std::mutex> servo_status_lock(servo_status_guard);
-              local_servo_status = latest_servo_status;
-              local_servo_status_received = servo_status_received;
-            }
-
-            RCLCPP_INFO_THROTTLE(
-                demo_node->get_logger(), *demo_node->get_clock(), 1000,
-                "Tracking diag: pos_err=%.4f m, rot_err=%.4f rad, joint_vel_norm=%.4f, joint_step_norm=%.4f, local_status=%s%s%s",
-                pos_error_norm, rot_error, joint_state.velocities.norm(), joint_pos_step_norm,
-                servo.getStatusMessage().c_str(),
-                local_servo_status_received ? " | topic_status=" : "",
-                local_servo_status_received ? local_servo_status.message.c_str() : "");
+            std::lock_guard<std::mutex> servo_status_lock(servo_status_guard);
+            local_servo_status = latest_servo_status;
+            local_servo_status_received = servo_status_received;
           }
+
+          RCLCPP_INFO_THROTTLE(
+              demo_node->get_logger(), *demo_node->get_clock(), 1000,
+              "Tracking diag: pos_err=%.4f m, rot_err=%.4f rad, cmd_lin=%.4f m/s, cmd_ang=%.4f rad/s, joint_vel_norm=%.4f, joint_step_norm=%.4f, local_status=%s%s%s",
+              position_error_norm, orientation_error_norm, linear_vel.norm(), angular_vel.norm(),
+              joint_state.velocities.norm(), joint_pos_step_norm, servo.getStatusMessage().c_str(),
+              local_servo_status_received ? " | topic_status=" : "",
+              local_servo_status_received ? local_servo_status.message.c_str() : "");
         }
         if (!joint_cmd_rolling_window.empty())
         {
@@ -408,8 +455,8 @@ int main(int argc, char* argv[])
       else
       {
         RCLCPP_WARN_THROTTLE(demo_node->get_logger(), *demo_node->get_clock(), 1000,
-                             "Servo rejected pose target: pos=[%.3f, %.3f, %.3f]",
-                             local_target_pose.position.x, local_target_pose.position.y, local_target_pose.position.z);
+                             "Servo rejected twist target: pos_err=%.4f rot_err=%.4f cmd_lin=%.4f cmd_ang=%.4f",
+                             position_error_norm, orientation_error_norm, linear_vel.norm(), angular_vel.norm());
       }
 
       if (status != StatusCode::NO_WARNING && status != StatusCode::INVALID)
@@ -418,9 +465,9 @@ int main(int argc, char* argv[])
         const std::string status_text =
             status_it != SERVO_STATUS_CODE_MAP.end() ? status_it->second : "Unknown servo status";
         RCLCPP_WARN_THROTTLE(demo_node->get_logger(), *demo_node->get_clock(), 1000,
-                             "Servo warning: %s | pose target=[%.3f, %.3f, %.3f]",
-                             status_text.c_str(), local_target_pose.position.x, local_target_pose.position.y,
-                             local_target_pose.position.z);
+                             "Servo warning: %s | pos_err=%.4f rot_err=%.4f cmd_lin=%.4f cmd_ang=%.4f",
+                             status_text.c_str(), position_error_norm, orientation_error_norm, linear_vel.norm(),
+                             angular_vel.norm());
       }
 
       tracking_rate.sleep();
