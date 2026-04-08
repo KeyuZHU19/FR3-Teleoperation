@@ -1,116 +1,160 @@
 
+# VR Teleoperation of Franka FR3 (ROS 2 + MoveIt Servo + Meta Quest)
 
-# VR Teleoperation of Franka FR3 with ROS 2, MoveIt Servo, and Oculus Reader
-
-This project demonstrates VR-based teleoperation of a Franka FR3 controlled with a Meta Quest controller using ROS 2, MoveIt Servo, and Oculus Reader.
-
-
-https://github.com/user-attachments/assets/ff2d912c-bed8-414c-b882-5f3fe7406fdc
-
-
+This repository contains our FR3 teleoperation stack with:
+- Franka ROS 2 control (`franka_hardware` + controllers)
+- MoveIt Servo velocity control
+- Meta Quest bridge based on Oculus Reader
+- One-click shell workflow to clean, start arm side, and start VR side
 
 ## Features
-1. **Low-Level Control**: The Franka arm is controlled by the `fr3_arm_controller`, which uses joint torque commands to achieve velocity tracking.
-2. **Singularity Handling**: MoveIt Servo reduces speed near singularities to prevent the arm from losing control.
-3. **Smooth Trajectories**: MoveIt Servo performs online trajectory interpolation of desired velocities, ensuring smooth commands sent to the ROS controller.
+- Real robot control through `fr3_arm_controller`
+- MoveIt Servo online filtering and singularity-aware slowdown
+- VR pose bridge (`set_target_pose` service pipeline)
+- Scripted startup and cleanup workflow (`scripts/run_franka_vr.sh`)
 
+## Environment Setup (Our Tested Setting)
 
-## Installation
+The commands below match the setup used during development and debugging.
 
-### Prerequisites
-- **Real-Time Kernel**: If your system does not yet have a real-time kernel installed and tested, follow the [Franka official tutorial](https://frankaemika.github.io/docs/installation_linux.html) to install and verify it with the provided test program.
-- **Docker**: Install `franka_ros2` via Docker. Refer to [libfranka-docker](https://github.com/ZorAttC/libfranka-docker/blob/main/docker_launch_files/docker-compose.yml).
+### 1. Host requirements
+- Ubuntu host with Docker
+- Real-time kernel recommended by Franka docs
+- Meta Quest connected via USB for ADB authorization
 
-### Setup Workspace
-1. **Clone MoveIt2 Tutorials**:
-   ```bash
-   cd /ws_moveit/src
-   git clone -b main https://github.com/moveit/moveit2_tutorials
-   vcs import --recursive < moveit2_tutorials/moveit2_tutorials.repos
-   ```
-   > **Warning**: MoveIt 2 is actively updated. Ensure the version of MoveIt 2 packages pulled via `moveit2_tutorials.repos` is `branch main` (tag `2.13.0`) to match the correct `moveit_servo` version. Avoid conflicts by removing any existing MoveIt installations:
-   ```bash
-   sudo apt remove ros-$ROS_DISTRO-moveit*
-   ```
+Reference for base container setup: [libfranka-docker](https://github.com/ZorAttC/libfranka-docker/blob/main/docker_launch_files/docker-compose.yml)
 
-2. **Install Dependencies**:
-   ```bash
-   sudo apt update && rosdep install -r --from-paths . --ignore-src --rosdistro $ROS_DISTRO -y
-   ```
+### 2. Container and workspace layout
+Our active container name:
 
-3. **Build Workspace**:
-   ```bash
-   cd ..
-   colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
-   ```
+```bash
+u22.04-franka_ros2_vrnew
+```
 
-4. **Add `franka_vr` Package**:
-   ```bash
-   cd src
-   git clone https://github.com/ZorAttC/franka_vr.git
-   cd ..
-   colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
-   ```
+Main paths used inside container:
+- Franka ROS 2 overlay: `/docker_volume/ros2_ws/install/setup.bash`
+- MoveIt workspace: `/ws_moveit2`
+- This package source path: `/ws_moveit2/src/franka_vr`
 
-## Execution
-1. **Launch Franka Arm**:
-   Open a terminal inside the Docker container:
-   ```bash
-   source /ros2_ws/install/setup.bash  # franka_ros2 environment
-   source /ws_moveit2/install/setup.bash  # MoveIt 2 environment
-   ros2 launch franka_vr franka_twist.launch.py
-   ```
-   After this step, RViz will display the Franka arm’s current pose.
+### 3. Install dependencies in container
 
-2. **Start VR Teleoperation**:
-   Open a second terminal:
-   ```bash
-   source /ros2_ws/install/setup.bash  # franka_ros2 environment
-   source /ws_moveit2/install/setup.bash  # MoveIt 2 environment
-   sh /ws_moveit2/src/oculus_reader/start_vr.sh
-   ```
-   This step displays the coordinate frames of the left and right hands in RViz.  
-   - **Controls**: After activating the controller, press and hold `rightTrig` to enable arm movement, hold `rightGrip` to close the gripper, and release `rightGrip` to open it.
+```bash
+docker exec -it u22.04-franka_ros2_vrnew bash
+
+source /opt/ros/humble/setup.bash
+cd /ws_moveit2
+rosdep install -r --from-paths src --ignore-src --rosdistro humble -y
+```
+
+Python dependencies required by VR bridge:
+
+```bash
+pip3 install --break-system-packages pure-python-adb tf-transformations termcolor
+```
+
+ADB tool (if missing):
+
+```bash
+apt-get update && apt-get install -y android-tools-adb
+```
+
+### 4. Build
+
+```bash
+docker exec u22.04-franka_ros2_vrnew bash -lc '
+  source /opt/ros/humble/setup.bash && \
+  source /docker_volume/ros2_ws/install/setup.bash && \
+  cd /ws_moveit2 && \
+  colcon build --packages-select franka_vr --cmake-args -DCMAKE_BUILD_TYPE=Release
+'
+```
+
+## Start Teleoperation (Using Our Shell Script)
+
+The script is:
+
+```bash
+scripts/run_franka_vr.sh
+```
+
+Default parameters inside the script:
+- `CONTAINER_NAME=u22.04-franka_ros2_vrnew`
+- `ROS_DOMAIN_ID_VALUE=66`
+- `ROBOT_IP=192.168.1.11`
+
+### Step 1. Cleanup stale processes
+
+```bash
+cd /home/franka/Collect_demo/franka_vr
+./scripts/run_franka_vr.sh cleanup
+```
+
+### Step 2. Start arm side (terminal A)
+
+```bash
+cd /home/franka/Collect_demo/franka_vr
+./scripts/run_franka_vr.sh arm
+```
+
+This launches:
+- `franka_twist.launch.py`
+- ros2_control + MoveIt Servo pipeline
+- optional RViz (`USE_RVIZ=true` by default)
+
+### Step 3. Start VR side (terminal B)
+
+```bash
+cd /home/franka/Collect_demo/franka_vr
+./scripts/run_franka_vr.sh vr
+```
+
+Script behavior:
+- checks ADB availability
+- ensures a Quest device is authorized (`adb devices` must show `device`)
+- avoids duplicate VR bridge startup
+- locates and runs `start_vr.sh`
+
+### Control mapping
+- Hold `rightTrig` to send arm motion commands
+- Hold `rightGrip` to close gripper
+- Release `rightGrip` to open gripper
+
+## Useful Script Commands
+
+```bash
+./scripts/run_franka_vr.sh check
+```
+
+Prints ROS graph diagnostics (`node list`, `/tf`, `/tf_static`) from inside the container.
+
+## Troubleshooting (From Real Runs)
+
+1. `No ADB device detected`
+- Reconnect Quest USB and allow authorization popup in headset.
+- Verify: `adb devices` shows one line with state `device`.
+
+2. VR script starts but arm does not move
+- Confirm trigger is actually pressed (`rightTrig > 0`), otherwise commands are gated.
+
+3. Build succeeds but launch cannot find executable link
+- Rebuild `franka_vr` and verify binary exists under install tree.
+- If needed, refresh the symlink used by launch path:
+
+```bash
+docker exec u22.04-franka_ros2_vrnew bash -lc '
+  mkdir -p /ws_moveit2/install/moveit_servo/lib/moveit_servo && \
+  ln -sf /ws_moveit2/install/franka_vr/lib/franka_vr/demo_franka_vr_vel \
+         /ws_moveit2/install/moveit_servo/lib/moveit_servo/demo_franka_vr_vel
+'
+```
+
+4. Arm aborts with `cartesian_reflex`
+- This is a hardware safety reflex (too aggressive command/jump), not only a launch problem.
+- Reduce motion aggressiveness and check VR target continuity.
 
 ## References
 - [MoveIt Servo Tutorial](https://moveit.picknik.ai/main/doc/examples/realtime_servo/realtime_servo_tutorial.html)
-- [MoveIt Tutorials](https://github.com/moveit/moveit_tutorials)
+- [MoveIt 2](https://github.com/moveit/moveit2)
 - [Oculus Reader](https://github.com/rail-berkeley/oculus_reader)
 - [Franka ROS 2](https://github.com/frankaemika/franka_ros2)
-- [Franka ROS 2 Docs](https://frankaemika.github.io/docs/franka_ros2.html)
 - [Franka Installation Guide](https://frankaemika.github.io/docs/installation_linux.html)
-
-## Limitations
-1. **Planning Scene Issue**: The `planning_scene` fails to retrieve `fr3_finger_joint1` (this does not affect gripper functionality, but the gripper state in RViz won’t update).
-2. **Singularity Behavior**: MoveIt Servo slows down near singularities but does not avoid them (advanced solutions like DLS control could address this).
-3. **Oculus Data Stability**: Data from the Oculus Reader occasionally jumps; filtering is applied but remains unstable.
-4. **Joint Limits**: No joint limits are enforced for the 7-DOF arm, which could reduce singularity occurrences if implemented.
-
-## Troubleshooting
-1. **Missing `osqp` Library**: Install `osqp` version `<=0.6.0`.
-2. **RViz Fails to Start**: Run `xhost +local:docker` to resolve display issues.
-
-## Discussion
-
-### Avoiding Singularities
-Singularities occur when the arm reaches a pose where the end-effector loses a degree of freedom in Cartesian space, causing the Jacobian matrix to become singular. This results in infinite joint velocities when mapping from Cartesian to joint space. In teleoperation, this manifests as:
-1. Sudden jerks with high velocity at certain positions.
-2. The arm stopping at singular positions due to velocity limits, no longer following commands.
-3. Shoulder joint singularities leading to multiple solutions, potentially causing abrupt 180-degree rotations of the shoulder or wrist joints.
-
-In teleoperation, the goal is to prevent the arm from entering singularities or to approach them at minimal speed. Near singularities, small end-effector movements can cause large joint changes, leading to poor motion quality or loss of control.
-
-#### Strategies to Avoid Singularities
-1. **Hardware Design**: Minimize singularities in the arm’s workspace through careful kinematic design.
-2. **DLS Method**: Use the Damped Least Squares (DLS) approach to compute the pseudo-inverse of the Jacobian. Switch to DLS control when the Jacobian’s determinant is small, reducing joint velocities near singularities at the cost of end-effector precision.
-3. **Planning Avoidance**: Avoid regions prone to singularities during trajectory planning.
-4. **Predictive Slowdown**: Use the Jacobian’s norm or determinant as a criterion. Predict the arm’s direction using recent end-effector position increments and reduce speed if the criterion worsens, preventing entry into singular regions (this sacrifices tracking accuracy).
-
-The most elegant solution for teleoperation is Option 2 (DLS), balancing responsiveness, safety (avoiding excessive joint velocities/accelerations), and slight precision trade-offs. MoveIt Servo’s current implementation resembles Option 4, slowing down near singularities to maintain control.
-
-### Initialization
-The arm’s workspace often mismatches the operator’s, especially for non-humanoid designs. Direct Euclidean mapping limits flexibility, as humans cannot reach many of the arm’s end-effector positions. Proper alignment and initialization between the arm’s workspace and the operator’s comfortable range are critical. This involves:
-- Setting the VR device’s base coordinate frame.
-- Adjusting pose scale and offset, typically fine-tuned through experimentation.
-
-For non-lab commercial scenarios (e.g., data collection centers), a fast workspace initialization algorithm is needed. A preliminary idea is to provide a controller for online parameter tuning (scale and offset). While slightly risky and suited for experienced operators, this allows users to adjust parameters during specific tasks and save them for future use.
