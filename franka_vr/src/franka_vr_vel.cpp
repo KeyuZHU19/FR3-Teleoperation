@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <moveit_msgs/msg/servo_status.hpp>
 #include <moveit_servo/servo.hpp>
 #include <moveit_servo/utils/common.hpp>
 #include <mutex>
@@ -46,7 +47,14 @@ static bool target_set = false;
 static uint64_t target_sequence = 0;
 static int64_t target_update_time_ns = 0;
 static uint64_t target_topic_message_count = 0;
+static geometry_msgs::msg::Pose previous_target_pose;
+static int64_t previous_target_update_time_ns = 0;
+static bool have_previous_target_pose = false;
 static std::mutex target_pose_guard;
+static moveit_msgs::msg::ServoStatus latest_servo_status;
+static bool servo_status_received = false;
+static uint64_t servo_status_message_count = 0;
+static std::mutex servo_status_guard;
 
 double compute_shortest_orientation_error(const geometry_msgs::msg::Pose& previous,
                                           const geometry_msgs::msg::Pose& current,
@@ -149,18 +157,64 @@ void set_target_pose_topic_callback(const rclcpp::Node::SharedPtr& node,
                                     const geometry_msgs::msg::PoseStamped::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(target_pose_guard);
+  const int64_t update_time_ns = msg->header.stamp.sec == 0 && msg->header.stamp.nanosec == 0 ?
+                                     node->get_clock()->now().nanoseconds() :
+                                     rclcpp::Time(msg->header.stamp).nanoseconds();
+
+  double input_dt_s = 0.0;
+  double input_dpos_norm_m = 0.0;
+  double input_dtheta_rad = 0.0;
+  if (have_previous_target_pose && previous_target_update_time_ns > 0 && update_time_ns > previous_target_update_time_ns)
+  {
+    input_dt_s = (update_time_ns - previous_target_update_time_ns) * 1e-9;
+    const Eigen::Vector3d delta_position(
+        msg->pose.position.x - previous_target_pose.position.x,
+        msg->pose.position.y - previous_target_pose.position.y,
+        msg->pose.position.z - previous_target_pose.position.z);
+    input_dpos_norm_m = delta_position.norm();
+    tf2::Quaternion q_prev, q_curr;
+    input_dtheta_rad =
+        compute_shortest_orientation_error(previous_target_pose, msg->pose, q_prev, q_curr);
+  }
+
   target_pose = msg->pose;
   target_set = true;
   ++target_sequence;
   ++target_topic_message_count;
-  target_update_time_ns = msg->header.stamp.sec == 0 && msg->header.stamp.nanosec == 0 ?
-                              node->get_clock()->now().nanoseconds() :
-                              rclcpp::Time(msg->header.stamp).nanoseconds();
+  target_update_time_ns = update_time_ns;
+  previous_target_pose = msg->pose;
+  previous_target_update_time_ns = update_time_ns;
+  have_previous_target_pose = true;
   RCLCPP_INFO_THROTTLE(node->get_logger(), *node->get_clock(), 1000,
                        "Received target_pose messages=%llu seq=%llu pos=[%.3f, %.3f, %.3f]",
                        static_cast<unsigned long long>(target_topic_message_count),
                        static_cast<unsigned long long>(target_sequence),
                        target_pose.position.x, target_pose.position.y, target_pose.position.z);
+  if (have_previous_target_pose && input_dt_s > 0.0)
+  {
+    RCLCPP_INFO_THROTTLE(node->get_logger(), *node->get_clock(), 1000,
+                         "Input diag: dt=%.4f s, dpos=%.4f m, dtheta=%.4f rad",
+                         input_dt_s, input_dpos_norm_m, input_dtheta_rad);
+  }
+}
+
+void servo_status_callback(const rclcpp::Node::SharedPtr& node,
+                           const moveit_msgs::msg::ServoStatus::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lock(servo_status_guard);
+  const bool code_changed = !servo_status_received || msg->code != latest_servo_status.code;
+  latest_servo_status = *msg;
+  servo_status_received = true;
+  ++servo_status_message_count;
+
+  if (code_changed || msg->code != moveit_msgs::msg::ServoStatus::NO_WARNING)
+  {
+    RCLCPP_INFO_THROTTLE(node->get_logger(), *node->get_clock(), 1000,
+                         "Servo status topic: code=%d message_count=%llu message='%s'",
+                         static_cast<int>(msg->code),
+                         static_cast<unsigned long long>(servo_status_message_count),
+                         msg->message.c_str());
+  }
 }
 
 Eigen::Vector3d compute_position_error(const geometry_msgs::msg::Pose& current, const geometry_msgs::msg::Pose& target)
@@ -199,6 +253,12 @@ int main(int argc, char* argv[])
       std::make_shared<const servo::ParamListener>(demo_node, param_namespace);
   const servo::Params servo_params = servo_param_listener->get_params();
 
+  auto servo_status_subscription = demo_node->create_subscription<moveit_msgs::msg::ServoStatus>(
+      servo_params.status_topic, rclcpp::SystemDefaultsQoS(),
+      [demo_node](const moveit_msgs::msg::ServoStatus::SharedPtr msg) {
+        servo_status_callback(demo_node, msg);
+      });
+
   auto trajectory_outgoing_cmd_pub = demo_node->create_publisher<trajectory_msgs::msg::JointTrajectory>(
       servo_params.command_out_topic, rclcpp::SystemDefaultsQoS());
 
@@ -224,6 +284,7 @@ int main(int argc, char* argv[])
     bool was_tracking_active = false;
     uint64_t last_seen_target_sequence = 0;
     uint64_t trajectory_publish_count = 0;
+    Eigen::VectorXd last_published_positions;
     rclcpp::WallRate tracking_rate(1 / servo_params.publish_period);
     std::deque<KinematicState> joint_cmd_rolling_window;
     KinematicState current_state = servo.getCurrentRobotState(true);
@@ -297,10 +358,45 @@ int main(int argc, char* argv[])
         {
           trajectory_outgoing_cmd_pub->publish(msg.value());
           ++trajectory_publish_count;
+          double joint_pos_step_norm = 0.0;
+          if (last_published_positions.size() == joint_state.positions.size())
+          {
+            joint_pos_step_norm = (joint_state.positions - last_published_positions).norm();
+          }
+          last_published_positions = joint_state.positions;
+
           RCLCPP_INFO_THROTTLE(demo_node->get_logger(), *demo_node->get_clock(), 1000,
                                "Published joint trajectory count=%llu points=%zu target_pos=[%.3f, %.3f, %.3f]",
                                static_cast<unsigned long long>(trajectory_publish_count), msg->points.size(),
                                local_target_pose.position.x, local_target_pose.position.y, local_target_pose.position.z);
+
+          auto actual_robot_state = planning_scene_monitor->getStateMonitor()->getCurrentState();
+          if (actual_robot_state)
+          {
+            const Eigen::Isometry3d actual_tip_pose = actual_robot_state->getGlobalLinkTransform(K_TIP_FRAME);
+            const Eigen::Isometry3d target_pose_eigen = pose_msg_to_eigen(local_target_pose);
+            const double pos_error_norm =
+                (target_pose_eigen.translation() - actual_tip_pose.translation()).norm();
+            const Eigen::Quaterniond q_target(target_pose_eigen.linear());
+            const Eigen::Quaterniond q_actual(actual_tip_pose.linear());
+            const double rot_error = q_actual.angularDistance(q_target);
+
+            moveit_msgs::msg::ServoStatus local_servo_status;
+            bool local_servo_status_received = false;
+            {
+              std::lock_guard<std::mutex> servo_status_lock(servo_status_guard);
+              local_servo_status = latest_servo_status;
+              local_servo_status_received = servo_status_received;
+            }
+
+            RCLCPP_INFO_THROTTLE(
+                demo_node->get_logger(), *demo_node->get_clock(), 1000,
+                "Tracking diag: pos_err=%.4f m, rot_err=%.4f rad, joint_vel_norm=%.4f, joint_step_norm=%.4f, local_status=%s%s%s",
+                pos_error_norm, rot_error, joint_state.velocities.norm(), joint_pos_step_norm,
+                servo.getStatusMessage().c_str(),
+                local_servo_status_received ? " | topic_status=" : "",
+                local_servo_status_received ? local_servo_status.message.c_str() : "");
+          }
         }
         if (!joint_cmd_rolling_window.empty())
         {

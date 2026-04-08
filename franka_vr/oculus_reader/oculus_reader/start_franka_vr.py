@@ -14,7 +14,7 @@ class OculusPublisher(Node):
         self.oculus_reader = OculusReader()
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
-        self.timer = self.create_timer(1.0 / 70.0, self.timer_callback)
+        self.timer = self.create_timer(1.0 / 50.0, self.timer_callback)
 
         # 声明 oculus_base 的参数
         self.declare_parameter('oculus_base.x', 0.05)
