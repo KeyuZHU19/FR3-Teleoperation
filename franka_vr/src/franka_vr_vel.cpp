@@ -86,6 +86,26 @@ Eigen::Vector3d apply_acceleration_limit(const Eigen::Vector3d& current,
   return next;
 }
 
+Eigen::Isometry3d pose_msg_to_eigen(const geometry_msgs::msg::Pose& pose_msg)
+{
+  Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+  pose.translation() =
+      Eigen::Vector3d(pose_msg.position.x, pose_msg.position.y, pose_msg.position.z);
+
+  Eigen::Quaterniond quat(pose_msg.orientation.w, pose_msg.orientation.x, pose_msg.orientation.y,
+                          pose_msg.orientation.z);
+  if (quat.norm() < 1e-8)
+  {
+    quat = Eigen::Quaterniond::Identity();
+  }
+  else
+  {
+    quat.normalize();
+  }
+  pose.linear() = quat.toRotationMatrix();
+  return pose;
+}
+
 void set_step_size_callback(const rclcpp::Node::SharedPtr& node,
                             const std::shared_ptr<franka_vr::srv::SetStepSize::Request> request,
                             std::shared_ptr<franka_vr::srv::SetStepSize::Response> response)
@@ -192,7 +212,7 @@ int main(int argc, char* argv[])
   const moveit::core::JointModelGroup* joint_model_group =
       robot_state->getJointModelGroup(servo_params.move_group_name);
 
-  servo.setCommandType(CommandType::TWIST);
+  servo.setCommandType(CommandType::POSE);
 
   std::deque<KinematicState> joint_cmd_rolling_window;
   KinematicState current_state = servo.getCurrentRobotState(true);
@@ -201,19 +221,9 @@ int main(int argc, char* argv[])
 
   auto pose_tracker = [&]() {
     KinematicState joint_state;
-    uint64_t last_processed_sequence = 0;
-    geometry_msgs::msg::Pose prev_target_pose;
-    int64_t prev_target_time_ns = 0;
-    bool have_prev_target = false;
     bool was_tracking_active = false;
-    Eigen::Vector3d desired_linear_vel = Eigen::Vector3d::Zero();
-    Eigen::Vector3d desired_angular_vel = Eigen::Vector3d::Zero();
-    Eigen::Vector3d filtered_linear_vel = Eigen::Vector3d::Zero();
-    Eigen::Vector3d filtered_angular_vel = Eigen::Vector3d::Zero();
     uint64_t last_seen_target_sequence = 0;
     uint64_t trajectory_publish_count = 0;
-    bool target_stream_active = false;
-    rclcpp::Time last_diagnostic_log_time(0, 0, demo_node->get_clock()->get_clock_type());
     rclcpp::WallRate tracking_rate(1 / servo_params.publish_period);
     std::deque<KinematicState> joint_cmd_rolling_window;
     KinematicState current_state = servo.getCurrentRobotState(true);
@@ -259,156 +269,25 @@ int main(int argc, char* argv[])
         local_target_set = false;
       }
 
-      if (local_target_set)
+      if (!local_target_set)
       {
-        target_stream_active = true;
-        if (!have_prev_target)
+        if (was_tracking_active)
         {
-          prev_target_pose = local_target_pose;
-          prev_target_time_ns = local_target_update_time_ns;
-          have_prev_target = true;
-          was_tracking_active = true;
-          last_processed_sequence = local_target_sequence;
-          RCLCPP_INFO_THROTTLE(demo_node->get_logger(), *demo_node->get_clock(), 1000,
-                               "Primed tracker with first target frame seq=%llu; waiting for next frame to compute delta",
-                               static_cast<unsigned long long>(local_target_sequence));
-        }
-        else if (local_target_sequence != last_processed_sequence)
-        {
-          const int64_t raw_dt_ns = local_target_update_time_ns - prev_target_time_ns;
-          const int64_t dt_ns = std::max<int64_t>(raw_dt_ns, static_cast<int64_t>(MIN_TARGET_DT_S * 1e9));
-          const double dt_s = std::min(dt_ns * 1e-9, TARGET_STALE_TIMEOUT_S);
-
-          Eigen::Vector3d delta_pos(local_target_pose.position.x - prev_target_pose.position.x,
-                                    local_target_pose.position.y - prev_target_pose.position.y,
-                                    local_target_pose.position.z - prev_target_pose.position.z);
-
-          tf2::Quaternion q_prev, q_curr;
-          const double delta_angle =
-              compute_shortest_orientation_error(prev_target_pose, local_target_pose, q_prev, q_curr);
-
-          if (delta_pos.norm() > MAX_TARGET_JUMP_POSITION_M || std::abs(delta_pos.z()) > MAX_TARGET_JUMP_Z_M ||
-              delta_angle > MAX_TARGET_JUMP_ROTATION_RAD)
-          {
-            RCLCPP_WARN(demo_node->get_logger(),
-                        "Target jump rejected: dpos=[%.3f, %.3f, %.3f], norm=%.3f, dtheta=%.3f rad",
-                        delta_pos.x(), delta_pos.y(), delta_pos.z(), delta_pos.norm(), delta_angle);
-            desired_linear_vel.setZero();
-            desired_angular_vel.setZero();
-          }
-          else
-          {
-            delta_pos = delta_pos.cwiseMax(Eigen::Vector3d::Constant(-MAX_TARGET_DELTA_POSITION_M))
-                            .cwiseMin(Eigen::Vector3d::Constant(MAX_TARGET_DELTA_POSITION_M));
-
-            tf2::Quaternion q_delta = q_curr * q_prev.inverse();
-            q_delta.normalize();
-
-            const double bounded_delta_angle = std::min(delta_angle, MAX_TARGET_DELTA_ROTATION_RAD);
-            Eigen::Vector3d delta_rotvec = Eigen::Vector3d::Zero();
-            if (bounded_delta_angle > 1e-6)
-            {
-              const tf2::Vector3 axis = q_delta.getAxis();
-              delta_rotvec = Eigen::Vector3d(axis.x(), axis.y(), axis.z()) * bounded_delta_angle;
-            }
-
-            double max_linear_speed = linear_step_size.norm() > 0 ? linear_step_size.norm() : 0.05;
-            double max_angular_speed = std::max({ x_step_size.angle(), y_step_size.angle(), z_step_size.angle() }) > 0 ?
-                                           std::max({ x_step_size.angle(), y_step_size.angle(), z_step_size.angle() }) :
-                                           0.4;
-
-            desired_linear_vel = delta_pos / dt_s;
-            desired_angular_vel = delta_rotvec / dt_s;
-
-            desired_linear_vel = desired_linear_vel.cwiseMax(Eigen::Vector3d::Constant(-max_linear_speed))
-                                     .cwiseMin(Eigen::Vector3d::Constant(max_linear_speed));
-            desired_angular_vel = desired_angular_vel.cwiseMax(Eigen::Vector3d::Constant(-max_angular_speed))
-                                      .cwiseMin(Eigen::Vector3d::Constant(max_angular_speed));
-
-            const double linear_norm = desired_linear_vel.norm();
-            if (linear_norm > LINEAR_VEL_HARD_LIMIT)
-            {
-              desired_linear_vel *= (LINEAR_VEL_HARD_LIMIT / linear_norm);
-            }
-
-            const double angular_norm = desired_angular_vel.norm();
-            if (angular_norm > ANGULAR_VEL_HARD_LIMIT)
-            {
-              desired_angular_vel *= (ANGULAR_VEL_HARD_LIMIT / angular_norm);
-            }
-
-            if (!(std::isfinite(desired_linear_vel.x()) && std::isfinite(desired_linear_vel.y()) &&
-                  std::isfinite(desired_linear_vel.z()) && std::isfinite(desired_angular_vel.x()) &&
-                  std::isfinite(desired_angular_vel.y()) && std::isfinite(desired_angular_vel.z())))
-            {
-              RCLCPP_WARN(demo_node->get_logger(),
-                          "Non-finite desired twist detected, resetting smoother and skipping frame");
-              desired_linear_vel.setZero();
-              desired_angular_vel.setZero();
-              current_state = servo.getCurrentRobotState(false);
-              servo.resetSmoothing(current_state);
-            }
-
-            const auto now = demo_node->now();
-            if ((now - last_diagnostic_log_time).seconds() >= DIAGNOSTIC_LOG_PERIOD_S)
-            {
-              RCLCPP_INFO(demo_node->get_logger(),
-                          "Teleop diag: dt=%.4f s (raw %.4f s), dpos_norm=%.4f m, dtheta=%.4f rad, cmd_lin=%.4f m/s, cmd_ang=%.4f rad/s",
-                          dt_s, raw_dt_ns * 1e-9, delta_pos.norm(), delta_angle, desired_linear_vel.norm(),
-                          desired_angular_vel.norm());
-              last_diagnostic_log_time = now;
-            }
-          }
-
-          prev_target_pose = local_target_pose;
-          prev_target_time_ns = local_target_update_time_ns;
-          have_prev_target = true;
-          was_tracking_active = true;
-          last_processed_sequence = local_target_sequence;
-        }
-      }
-      else
-      {
-        desired_linear_vel.setZero();
-        desired_angular_vel.setZero();
-        if (target_stream_active)
-        {
-          RCLCPP_INFO_THROTTLE(demo_node->get_logger(), *demo_node->get_clock(), 1000,
-                               "Target stream became inactive; ramping commanded twist to zero");
-        }
-        target_stream_active = false;
-        have_prev_target = false;
-      }
-
-      filtered_linear_vel =
-          apply_acceleration_limit(filtered_linear_vel, desired_linear_vel, LINEAR_ACCEL_LIMIT, servo_params.publish_period);
-      filtered_angular_vel = apply_acceleration_limit(filtered_angular_vel, desired_angular_vel, ANGULAR_ACCEL_LIMIT,
-                                                      servo_params.publish_period);
-
-      const bool commanded_zero = filtered_linear_vel.norm() < ZERO_TWIST_EPS && filtered_angular_vel.norm() < ZERO_TWIST_EPS;
-
-      if (commanded_zero)
-      {
-        filtered_linear_vel.setZero();
-        filtered_angular_vel.setZero();
-        if (!target_stream_active && was_tracking_active)
-        {
-          have_prev_target = false;
           current_state = servo.getCurrentRobotState(false);
           servo.resetSmoothing(current_state);
           was_tracking_active = false;
           RCLCPP_INFO_THROTTLE(demo_node->get_logger(), *demo_node->get_clock(), 1000,
-                               "Filtered twist decayed to zero; waiting for fresh target updates");
+                               "Target stream inactive; pose tracking paused");
         }
         tracking_rate.sleep();
         continue;
       }
 
-      TwistCommand target_twist{ K_BASE_FRAME,
-                                 { filtered_linear_vel.x(), filtered_linear_vel.y(), filtered_linear_vel.z(),
-                                   filtered_angular_vel.x(), filtered_angular_vel.y(), filtered_angular_vel.z() } };
+      PoseCommand target_pose_command;
+      target_pose_command.frame_id = K_BASE_FRAME;
+      target_pose_command.pose = pose_msg_to_eigen(local_target_pose);
 
-      joint_state = servo.getNextJointState(robot_state, target_twist);
+      joint_state = servo.getNextJointState(robot_state, target_pose_command);
       StatusCode status = servo.getStatus();
 
       if (status != StatusCode::INVALID)
@@ -419,21 +298,22 @@ int main(int argc, char* argv[])
           trajectory_outgoing_cmd_pub->publish(msg.value());
           ++trajectory_publish_count;
           RCLCPP_INFO_THROTTLE(demo_node->get_logger(), *demo_node->get_clock(), 1000,
-                               "Published joint trajectory count=%llu points=%zu filtered_lin=%.4f filtered_ang=%.4f",
+                               "Published joint trajectory count=%llu points=%zu target_pos=[%.3f, %.3f, %.3f]",
                                static_cast<unsigned long long>(trajectory_publish_count), msg->points.size(),
-                               filtered_linear_vel.norm(), filtered_angular_vel.norm());
+                               local_target_pose.position.x, local_target_pose.position.y, local_target_pose.position.z);
         }
         if (!joint_cmd_rolling_window.empty())
         {
           robot_state->setJointGroupPositions(joint_model_group, joint_cmd_rolling_window.back().positions);
           robot_state->setJointGroupVelocities(joint_model_group, joint_cmd_rolling_window.back().velocities);
         }
+        was_tracking_active = true;
       }
       else
       {
         RCLCPP_WARN_THROTTLE(demo_node->get_logger(), *demo_node->get_clock(), 1000,
-                             "Servo rejected filtered twist: lin=%.4f m/s ang=%.4f rad/s",
-                             filtered_linear_vel.norm(), filtered_angular_vel.norm());
+                             "Servo rejected pose target: pos=[%.3f, %.3f, %.3f]",
+                             local_target_pose.position.x, local_target_pose.position.y, local_target_pose.position.z);
       }
 
       if (status != StatusCode::NO_WARNING && status != StatusCode::INVALID)
@@ -442,9 +322,9 @@ int main(int argc, char* argv[])
         const std::string status_text =
             status_it != SERVO_STATUS_CODE_MAP.end() ? status_it->second : "Unknown servo status";
         RCLCPP_WARN_THROTTLE(demo_node->get_logger(), *demo_node->get_clock(), 1000,
-                             "Servo warning: %s | filtered lin=%.4f ang=%.4f desired lin=%.4f desired ang=%.4f",
-                             status_text.c_str(), filtered_linear_vel.norm(), filtered_angular_vel.norm(),
-                             desired_linear_vel.norm(), desired_angular_vel.norm());
+                             "Servo warning: %s | pose target=[%.3f, %.3f, %.3f]",
+                             status_text.c_str(), local_target_pose.position.x, local_target_pose.position.y,
+                             local_target_pose.position.z);
       }
 
       tracking_rate.sleep();
