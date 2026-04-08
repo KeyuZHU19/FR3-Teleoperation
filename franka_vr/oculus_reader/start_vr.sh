@@ -4,5 +4,7 @@
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 cd "$SCRIPT_DIR" || exit 1
 
-# 运行 Python 脚本
-python3 oculus_reader/start_franka_vr.py
+# 以脚本方式启动，并补齐包搜索路径
+cd "$SCRIPT_DIR/oculus_reader" || exit 1
+export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
+python3 start_franka_vr.py

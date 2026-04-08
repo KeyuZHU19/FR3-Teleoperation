@@ -179,7 +179,9 @@ class OculusReader:
 
     def get_transformations_and_buttons(self):
         with self._lock:
-            return self.last_transforms, self.last_buttons
+            transforms_copy = {k: v.copy() for k, v in self.last_transforms.items()}
+            buttons_copy = dict(self.last_buttons)
+            return transforms_copy, buttons_copy
 
     def read_logcat_by_line(self, connection):
         file_obj = connection.socket.makefile()

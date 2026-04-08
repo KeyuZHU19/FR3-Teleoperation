@@ -19,14 +19,12 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchContext, LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
-    IncludeLaunchDescription,
     OpaqueFunction,
     Shutdown,
     ExecuteProcess,
 )
 from launch.conditions import IfCondition, UnlessCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from launch_param_builder import ParameterBuilder
@@ -44,7 +42,7 @@ def setup_moveit_config():
                 "robot_ip": LaunchConfiguration("robot_ip"),
                 "use_fake_hardware": LaunchConfiguration("use_fake_hardware"),
                 "fake_sensor_commands": LaunchConfiguration("fake_sensor_commands"),
-                "hand": "true",  # 启用手部
+                "hand": "true",
             }
         )
         .robot_description_semantic(
@@ -84,7 +82,8 @@ def robot_description_dependent_nodes_spawner(
         use_fake_hardware,
         fake_sensor_commands,
         load_gripper,
-        arm_prefix):
+    arm_prefix,
+    use_rviz):
 
     robot_ip_str = context.perform_substitution(robot_ip)
     arm_id_str = context.perform_substitution(arm_id)
@@ -108,7 +107,7 @@ def robot_description_dependent_nodes_spawner(
                                            }).toprettyxml(indent='  ')
 
     franka_controllers = PathJoinSubstitution(
-        [FindPackageShare('franka_bringup'), 'config', 'controllers.yaml'])
+        [FindPackageShare('franka_vr'), 'config', 'fr3_ros_controllers.yaml'])
     # 构建 MoveIt 配置
     moveit_config = setup_moveit_config()
     # # Get parameters for the Servo node
@@ -119,7 +118,7 @@ def robot_description_dependent_nodes_spawner(
     }
     # Servo node
     servo_node = Node(
-        package="moveit_servo",
+        package="franka_vr",
         executable="demo_franka_vr_vel",
         parameters=[
             servo_params,
@@ -143,6 +142,7 @@ def robot_description_dependent_nodes_spawner(
             moveit_config.robot_description,
             moveit_config.robot_description_semantic,
         ],
+        condition=IfCondition(use_rviz),
     )
     return [
         Node(
@@ -151,6 +151,7 @@ def robot_description_dependent_nodes_spawner(
             name='robot_state_publisher',
             output='screen',
             parameters=[{'robot_description': robot_description}],
+            remappings=[('joint_states', 'franka/joint_states')],
         ),
         Node(
             package='controller_manager',
@@ -198,7 +199,8 @@ def generate_launch_description():
             use_fake_hardware,
             fake_sensor_commands,
             load_gripper,
-            arm_prefix])
+            arm_prefix,
+            use_rviz])
  
     launch_description = LaunchDescription([
         DeclareLaunchArgument(
@@ -234,20 +236,30 @@ def generate_launch_description():
         
     
         robot_description_dependent_nodes_spawner_opaque_function,
+        # Spawn controllers in one call to avoid parallel spawner race conditions.
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['joint_state_broadcaster'],
-            output='screen',
-        ),
-    
-        Node(
-            package='controller_manager',
-            executable='spawner',
-            arguments=['franka_robot_state_broadcaster'],
-            parameters=[{'arm_id': arm_id}],
+            arguments=[
+                'joint_state_broadcaster',
+                'fr3_arm_controller',
+                '-c', '/controller_manager',
+                '--activate-as-group',
+            ],
             output='screen',
             condition=UnlessCondition(use_fake_hardware),
+        ),
+        Node(
+            package='controller_manager',
+            executable='spawner',
+            arguments=[
+                'joint_state_broadcaster',
+                'fr3_arm_controller',
+                '-c', '/controller_manager',
+                '--activate-as-group',
+            ],
+            output='screen',
+            condition=IfCondition(use_fake_hardware),
         ),
 
         Node(
@@ -258,19 +270,45 @@ def generate_launch_description():
         output="screen"
         ),
         Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=["fr3_arm_controller", "-c", "/controller_manager"],
-         ),
-    IncludeLaunchDescription(
-            PythonLaunchDescriptionSource([PathJoinSubstitution(
-                [FindPackageShare('franka_gripper'), 'launch', 'gripper.launch.py'])]),
-            launch_arguments={robot_ip_parameter_name: robot_ip,
-                              use_fake_hardware_parameter_name: use_fake_hardware,
-                              'arm_id':arm_id}.items(),
-            condition=IfCondition(load_gripper)
-        )
-    ,
+            package='franka_gripper',
+            executable='franka_gripper_node',
+            name=[arm_id, '_gripper'],
+            parameters=[
+                {
+                    'robot_ip': robot_ip,
+                    'joint_names': ['fr3_finger_joint1', 'fr3_finger_joint2'],
+                },
+                PathJoinSubstitution(
+                    [FindPackageShare('franka_gripper'), 'config', 'franka_gripper_node.yaml']
+                ),
+            ],
+            remappings=[('~/joint_states', 'franka/joint_states')],
+            condition=IfCondition(
+                PythonExpression([
+                    "'", load_gripper, "' == 'true' and '", use_fake_hardware, "' == 'false'"
+                ])
+            ),
+        ),
+        Node(
+            package='franka_gripper',
+            executable='fake_gripper_state_publisher.py',
+            name=[arm_id, '_gripper'],
+            parameters=[
+                {
+                    'robot_ip': robot_ip,
+                    'joint_names': ['fr3_finger_joint1', 'fr3_finger_joint2'],
+                },
+                PathJoinSubstitution(
+                    [FindPackageShare('franka_gripper'), 'config', 'franka_gripper_node.yaml']
+                ),
+            ],
+            remappings=[('~/joint_states', 'franka/joint_states')],
+            condition=IfCondition(
+                PythonExpression([
+                    "'", load_gripper, "' == 'true' and '", use_fake_hardware, "' == 'true'"
+                ])
+            ),
+        ),
         # Node(package='rviz2',
         #      executable='rviz2',
         #      name='rviz2',

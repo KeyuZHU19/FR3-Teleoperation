@@ -3,11 +3,10 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster, Buffer, TransformListener
-from geometry_msgs.msg import TransformStamped, Pose
+from geometry_msgs.msg import TransformStamped, Pose, PoseStamped
 from tf_transformations import quaternion_from_matrix, quaternion_from_euler
 import numpy as np
 from franka_msgs.action import Move,Homing, Grasp
-from franka_vr.srv import SetTargetPose
 from termcolor import cprint
 class OculusPublisher(Node):
     def __init__(self):
@@ -32,10 +31,10 @@ class OculusPublisher(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # 创建服务客户端，用于末端控制
-        self.cli = self.create_client(SetTargetPose, 'set_target_pose')
-        while not self.cli.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for service set_target_pose...')
+        # 连续位姿流使用 topic，避免高频 service 请求在服务器侧排队/批处理。
+        self.target_pose_pub = self.create_publisher(PoseStamped, '/moveit_servo_demo/target_pose', 10)
+        self.target_pose_publish_count = 0
+        self.last_target_pose_log_time = self.get_clock().now()
 
         # 创建 Action 客户端，用于夹爪控制
         self.action_client = ActionClient(self, Move, '/fr3_gripper/move')
@@ -53,13 +52,11 @@ class OculusPublisher(Node):
 
         # 夹爪状态跟踪
         self.gripper_state = False  # None: 未初始化, True: 关闭, False: 打开
-        self.scale = 1.5  # translation缩放因子
+        self.scale = 1.5  # translation缩放因子 o: 1.5
     
 
         self.last_gripper_send_time = self.get_clock().now()
         self.gripper_send_interval = 0.2  # 5 Hz
-
-        self.scale = 1.5  # translation缩放因子
 
         #过滤跳变
         self.last_transform = None
@@ -111,10 +108,11 @@ class OculusPublisher(Node):
                     diff = np.linalg.norm(translation - self.last_transform)
                     if diff > 0.1:  # 设定一个阈值
                         cprint(f"Translation difference for {name}: {diff}", 'red')
-                        self.last_transform=translation
+                        self.last_transform = translation.copy()
                         return
                 else:
-                    self.last_transform = translation
+                    self.last_transform = translation.copy()
+                self.last_transform = translation.copy()
             
             
             t = TransformStamped()
@@ -138,17 +136,27 @@ class OculusPublisher(Node):
             self.get_logger().warning(f"Error publishing transform for {name}: {str(e)}")
 
     def send_target_pose(self, transform_stamped):
-        """发送末端目标位姿给 set_target_pose 服务"""
-        pose = Pose()
-        pose.position.x = transform_stamped.transform.translation.x
-        pose.position.y = transform_stamped.transform.translation.y
-        pose.position.z = transform_stamped.transform.translation.z
-        pose.orientation = transform_stamped.transform.rotation
+        """发布末端目标位姿；header.stamp 作为控制侧 dt 的时间基准。"""
+        pose_msg = PoseStamped()
+        pose_msg.header.stamp = self.get_clock().now().to_msg()
+        pose_msg.header.frame_id = transform_stamped.header.frame_id
+        pose_msg.pose.position.x = transform_stamped.transform.translation.x
+        pose_msg.pose.position.y = transform_stamped.transform.translation.y
+        pose_msg.pose.position.z = transform_stamped.transform.translation.z
+        pose_msg.pose.orientation = transform_stamped.transform.rotation
+        self.target_pose_pub.publish(pose_msg)
+        self.target_pose_publish_count += 1
 
-        req = SetTargetPose.Request()
-        req.target_pose = pose
-
-        self.cli.call_async(req)
+        now = self.get_clock().now()
+        if (now - self.last_target_pose_log_time).nanoseconds > int(1e9):
+            self.get_logger().info(
+                "Publishing target_pose at ~live rate, total=%d latest_pos=[%.3f, %.3f, %.3f]",
+                self.target_pose_publish_count,
+                pose_msg.pose.position.x,
+                pose_msg.pose.position.y,
+                pose_msg.pose.position.z,
+            )
+            self.last_target_pose_log_time = now
 
     def send_homing_goal(self):
         """发送夹爪打开命令 (Homing)"""
@@ -209,7 +217,7 @@ class OculusPublisher(Node):
 
         # 处理右控制器
         if 'r' in transformations:
-            right_controller_pose = transformations['r']
+            right_controller_pose = transformations['r'].copy()
             right_controller_pose[0:3, 3] *= self.scale  # 缩放位移
             modified_right_pose = np.dot(right_controller_pose, rot_z_minus_90)
             modified_right_pose = np.dot(modified_right_pose, rot_y_90)
@@ -217,7 +225,7 @@ class OculusPublisher(Node):
 
         # 处理左控制器
         if 'l' in transformations:
-            left_controller_pose = transformations['l']
+            left_controller_pose = transformations['l'].copy()
             left_controller_pose[0:3, 3] *= self.scale
             modified_left_pose = np.dot(left_controller_pose, rot_z_minus_90)
             self.publish_transform(modified_left_pose, 'oculus_left')
