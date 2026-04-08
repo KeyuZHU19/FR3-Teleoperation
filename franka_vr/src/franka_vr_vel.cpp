@@ -23,15 +23,15 @@ constexpr auto K_BASE_FRAME = "fr3_link0";
 constexpr auto K_TIP_FRAME = "fr3_hand";
 constexpr double POSITION_TOLERANCE = 0.002;     // 位置容差（米）
 constexpr double ORIENTATION_TOLERANCE = 0.05;  // 角度容差（弧度）
-constexpr double LINEAR_VEL_HARD_LIMIT = 0.46;   // m/s
-constexpr double ANGULAR_VEL_HARD_LIMIT = 1.20;  // rad/s
+constexpr double LINEAR_VEL_HARD_LIMIT = 0.52;   // m/s
+constexpr double ANGULAR_VEL_HARD_LIMIT = 1.28;  // rad/s
 constexpr double TARGET_STALE_TIMEOUT_S = 0.20;  // 超时后清零，防止陈旧目标持续积分
 }  // namespace
 
-static Eigen::Vector3d linear_step_size{ 0.35, 0.35, 0.35 };
-static Eigen::AngleAxisd x_step_size(0.98, Eigen::Vector3d::UnitX());
-static Eigen::AngleAxisd y_step_size(0.98, Eigen::Vector3d::UnitY());
-static Eigen::AngleAxisd z_step_size(0.98, Eigen::Vector3d::UnitZ());
+static Eigen::Vector3d linear_step_size{ 0.39, 0.39, 0.39 };
+static Eigen::AngleAxisd x_step_size(1.05, Eigen::Vector3d::UnitX());
+static Eigen::AngleAxisd y_step_size(1.05, Eigen::Vector3d::UnitY());
+static Eigen::AngleAxisd z_step_size(1.05, Eigen::Vector3d::UnitZ());
 static geometry_msgs::msg::Pose target_pose;
 static bool target_set = false;
 static uint64_t target_sequence = 0;
